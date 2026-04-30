@@ -592,11 +592,13 @@ cache 中保存的 K 统一按已旋转后的 K 处理。
 6. H200/Hopper dispatch 与 WS/TMA-friendly 优化
 7. 低优先级 `return_lse` / stats 暴露决策
 
+注意：这里的顺序表达的是实现关注点，不表示 manifest 可以滞后。任何新增或改变 release-facing OP contract 的 FP8 PR，都必须在同一个 PR 中同步更新 manifest、workloads、roofline、source metadata 和对应 tests；不能先合实现、再用后续 PR 补 manifest。
+
 如果目标是尽快接 serving runtime，则优先级可调整为：
 
 1. paged FP8 KV cache
 2. contiguous FP8 KV cache
-3. benchmark / roofline / manifest 完整度
+3. manifest-backed benchmark / roofline 完整度
 4. H200 dispatch
 
 ## 七、风险与待决策项
@@ -650,6 +652,15 @@ cache 中保存的 K 统一按已旋转后的 K 处理。
 ### 4. TMA / Pipeline 优化
 
 当前 contiguous cache fused kernel 为了动态 load 分流，禁用了 TMA lowering 和 warp-specialized lowering。
+
+重新启用 TMA / WS 的判断标准：
+
+- old-cache tile 和 new-chunk tile 能在 kernel 内被静态或 tile-level predicate 清晰分离；
+- 完全落在 old cache 的 tile 能表达成规则 contiguous copy，满足 TMA / bulk async copy 的对齐和粒度要求；
+- 完全落在 current chunk 的 tile 能走常规 contiguous load；
+- 只有跨 old/new 边界的少数 tile 继续走 guarded elementwise load；
+- 对 paged KV，只有当 page segment 足够规则，且 `page_size` / `block_n` 关系能让一个 tile 分解成少量整页或整块 segment 时，才考虑 TMA-friendly gather path；
+- dispatch 必须留在 #1102 的 H200/Hopper 路线中，不能改变公开 OP signature。
 
 待优化方向：
 

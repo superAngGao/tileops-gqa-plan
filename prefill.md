@@ -295,6 +295,8 @@
 - `chunked prefill`
 - `prefill/decode backend 分离`
 
+这里把 `kv_layout` 归到 runtime-heavy 维度，并不表示 paged KV 不应该成为独立 OP。更准确的拆分是：page allocation、page reuse、eviction、prefix sharing 和 `cache_seqlens` 生命周期是 runtime/cache manager 的责任；但一次 paged attention 计算本身需要消费 `block_table`、`cache_seqlens`、physical page storage，并执行 gather/read/append，这部分必须成为 kernel/OP 的正式契约。因此 `GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp` 暴露的是 paged attention 的计算接口，不是 page manager。
+
 这一区分很重要，因为一个“prefill 规划”既不能只写 kernel 语义，也不能把所有 runtime 机制都硬塞进同一个 attention 算子接口。
 
 ### 2.3.4 什么叫 kernel 维度，什么叫 runtime 维度
