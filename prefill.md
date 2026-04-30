@@ -107,6 +107,8 @@
 4. `scale granularity` 不同的 `fp8`
 - `per-tensor scale`
 - `per-head scale`
+- `per-token / per-token-head scale`
+- `per-page scale`
 - `per-channel scale`
 - `per-block scale`
 
@@ -691,11 +693,13 @@ MVP 的核心结论可以压成一句话：
 
 #### 1. 用户可见的稳定命名
 
+- `GroupedQueryAttentionPrefillFwdOp`
 - `GroupedQueryAttentionPrefillVarlenFwdOp`
 - `GroupedQueryAttentionPrefillWithKVCacheFwdOp`
 - `GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp`
 
-这三个名字分别对应：
+这四个名字分别对应：
+- dense BSHD 的基础 prefill
 - packed/varlen 的普通 prefill
 - 带连续 KV cache 的 prefill
 - 带 paged KV cache 的 prefill
@@ -815,7 +819,47 @@ MVP 的核心结论可以压成一句话：
 ### 5.4 接口设计
 
 不建议把所有路径塞进一个超大接口。  
-建议发布时对外暴露三类接口。
+建议发布时对外暴露四类稳定入口。
+
+#### 0. `GroupedQueryAttentionPrefillFwdOp`
+
+用于：
+- dense BSHD prefill
+- q 和 kv 都已经 materialized，不直接操作外部 KV cache 的场景
+- 固定长度 batch 或 benchmark / reference-friendly path
+
+```python
+class GroupedQueryAttentionPrefillFwdOp(Op):
+    def __init__(
+        self,
+        batch: int,
+        heads: int,
+        heads_kv: int,
+        dim: int,
+        is_causal: bool = True,
+        sm_scale: Optional[float] = None,
+        softcap: Optional[float] = None,
+        dtype: torch.dtype = torch.float16,
+        accum_dtype: torch.dtype = torch.float32,
+        kernel_map: Optional[Dict[str, Kernel]] = None,
+        tune: bool = False,
+    ) -> None:
+        ...
+
+    def forward(
+        self,
+        q: torch.Tensor,                 # [B, S_q, Hq, D]
+        k: torch.Tensor,                 # [B, S_kv, Hkv, D]
+        v: torch.Tensor,                 # [B, S_kv, Hkv, D]
+    ) -> torch.Tensor:
+        ...
+```
+
+这个接口覆盖 dense baseline：
+- `q_len == kv_len` 的标准 prompt prefill
+- `q_len < kv_len` 的 chunk/reference path
+- bottom-right causal alignment
+- MHA/GQA/MQA head topology
 
 #### 1. `GroupedQueryAttentionPrefillVarlenFwdOp`
 
@@ -1120,13 +1164,284 @@ class GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp(Op):
 - 对调用方和测试都不友好
 
 更稳妥的做法是：
-- 对外稳定暴露三类接口
+- 对外稳定暴露四类接口：dense baseline、packed varlen、contiguous cache、paged cache
 - 如有需要，在更上层提供一个 convenience wrapper 做 dispatch
 
 这样可以同时兼顾：
 - operator contract 清晰
 - runtime 对接自然
 - 后续 kernel 演化自由度更大
+
+### 5.9 调研归纳与 TileOps 接口决策
+
+前面的调研可以进一步压缩成一个用户心智问题：
+
+**用户在调用 prefill 时，首先关心的不是 kernel 变体，而是这批数据和 KV cache 是怎么组织的。**
+
+因此 TileOps 的公开接口应该围绕数据组织和 cache 契约拆分，而不是围绕 Hopper/WGMMA/WS/TMA、是否 fused、是否走某个特殊 kernel 拆分。
+
+#### 1. 从其他项目看到的接口形态
+
+不同项目的接口风格不一样，但它们大体落在几类模式里：
+
+- `PyTorch SDPA` / `xFormers`
+  更像通用 attention API。它们把 `mask`、`causal`、`scale`、`GQA` 作为语义参数，但基本不接管 serving KV cache 生命周期。
+
+- `FlashAttention`
+  把 dense、varlen、KV cache 路径拆成不同函数。`flash_attn_with_kvcache` 一类接口会直接暴露 `k_cache/v_cache`、`cache_seqlens`、`block_table`、RoPE、softcap 等参数，说明 cache-aware prefill 需要独立接口，而不是普通 dense attention 的一个小开关。
+
+- `FlashInfer`
+  更偏 serving operator。它把 ragged/paged KV、plan/run、paged append、`return_lse`、量化 scale 等拆成明确 wrapper 或辅助 API，说明 `sequence_layout` 和 `kv_layout` 应该被分开建模。
+
+- `TensorRT-LLM` / `vLLM` / `SGLang`
+  更偏 runtime。它们把 paged KV、chunked prefill、prefix cache、FP8 KV cache、backend selection 放在系统配置或运行时策略里，而不是让用户直接选择某个底层 kernel。
+
+- `cuDNN Frontend`
+  更像完整 graph API。它能表达非常多 attention 维度，包括 ragged/paged、score modifier、stats、mask alignment 等，但这类接口对 TileOps 当前公开 OP 来说过重，更适合作为能力边界参考，而不是直接照搬。
+
+#### 2. TileOps 的公开调用入口按 layout/cache contract 拆分
+
+基于上面的调研，TileOps 首发发布接口建议保持四个用户可见入口：
+
+- `GroupedQueryAttentionPrefillFwdOp`
+  用于 dense BSHD baseline prefill，覆盖固定长度 batch、reference-friendly path 和 q/kv 已经 materialized 的场景。
+
+- `GroupedQueryAttentionPrefillVarlenFwdOp`
+  用于 packed varlen prefill，不直接管理外部 KV cache。
+
+- `GroupedQueryAttentionPrefillWithKVCacheFwdOp`
+  用于 contiguous KV cache prefill，读取 old cache，并把 current chunk 的 K/V append 回 cache。
+
+- `GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp`
+  用于 paged KV cache prefill，通过 `block_table` 寻址物理页，是后续 serving runtime 的主力对接入口。
+
+这个拆分和用户心智更一致：
+
+- 输入是否 packed / varlen，是 `sequence_layout` 问题。
+- KV 是 contiguous 还是 paged，是 `kv_layout` 问题。
+- 这次调用是否 append 新 K/V，是 `kv_update_contract` 问题。
+- 这些问题比“内部走哪个 kernel”更适合作为公开 OP 边界。
+
+#### 3. Cache ownership 的决策：OP 消费 caller-owned cache，不做分配
+
+cache-aware prefill 的底层 OP 应该采用 caller-owned cache 契约：
+
+- 调用方或 runtime 预先分配 `k_cache/v_cache` 或 `k_pages/v_pages`。
+- 调用方或 runtime 准备 `cache_seqlens`、`block_table`、page allocation 等 metadata。
+- OP 在调用前校验 shape、dtype、capacity、page table 边界。
+- kernel 在已有 storage 上原地 append current chunk。
+- OP / kernel 不负责分配 cache 空间，也不负责更新 `cache_seqlens`。
+- 调用成功后，runtime 再把对应 request 的 `cache_seqlens` 增加 current chunk 长度。
+
+这个设计符合底层算子库心智，也和 FlashInfer / FlashAttention 这类 operator API 接近。原因是 page allocation、prefix sharing、eviction、cyclic cache、request ownership 都属于 runtime/cache manager 的职责，不应放进单个 attention kernel。
+
+但这并不完全等于 serving 用户心智。serving 用户通常想表达的是：
+
+```text
+把当前 chunk prefill 进这个 request/session 的 cache
+```
+
+而不是手动管理：
+
+```text
+k_pages / v_pages / block_table / cache_seqlens / page_size / max_pages_per_req
+```
+
+因此文档里需要明确分层：
+
+- **底层 TileOps OP**：保持 caller-owned cache，便于接入已有 runtime。
+- **可选高层 wrapper**：未来可以提供 `PagedKVCache` / `KVCacheConfig` 这类对象，封装 page 分配、`cache_seqlens` 更新和 metadata 管理，底层仍调用相同 OP。
+
+对 FP8 KV cache 也采用同样边界：
+
+- FP8 cache tensor 和 scale / scale metadata 由外部 runtime 预分配并传入。
+- `k_new/v_new` 仍是新算出来的 `fp16/bf16`。
+- OP 负责 attention 计算中读取 old FP8 cache 并按 scale 使用。
+- OP 负责把 current `k_new/v_new` 量化后写入 caller-owned FP8 cache。
+- 如果未来支持 per-token-head / per-page-head scale，相关 scale storage 也应由 runtime 传入，OP 只负责写对应位置。
+
+当前已有实现已经符合这个方向：contiguous 和 paged append 都在 kernel 内原地写 cache；current chunk 的 attention 直接读 `k_new/v_new`，old prefix 才从 cache 读。后续 FP8 实现应在这个结构上增加 old-cache dequant 和 append-time quantize，而不是改成 OP 自动分配 cache。
+
+#### 4. 不把 kernel 形态暴露成用户接口
+
+下面这些应该是内部 dispatch 目标，而不是用户需要直接选择的 OP：
+
+- WGMMA kernel
+- WS / warp-specialized kernel
+- TMA kernel
+- fast path / gather path
+- fused RoPE kernel
+- H200-specialized kernel
+
+原因是这些名字描述的是实现策略，不是用户正在表达的 prefill 语义。
+
+对用户来说，更稳定的问题是：
+
+- 我的输入是 dense、packed varlen，还是 cache-aware？
+- 我的 KV cache 是 contiguous 还是 paged？
+- 我是否要在这次调用里 append K/V？
+- 我是否需要 RoPE、softcap、FP8 KV cache、`return_lse`？
+
+内部则可以在相同 OP 契约下根据 dtype、head dim、page size、sequence length、硬件和 feature flag 选择不同 kernel。
+
+#### 5. RoPE 的决策：语义参数优先，fused 是实现路径
+
+RoPE 不应在用户心智里首先表现为“是否 fused”。更自然的用户语义是：
+
+- 输入已经在外部完成 RoPE：`position_mode="none"`，或者不传 RoPE 参数。
+- OP 内部负责 RoPE：`position_mode="rope"`，并提供 `position_ids` / `cache_positions_new` / `rope_cos` / `rope_sin` 或等价配置。
+
+对于 cache-aware prefill，RoPE 语义必须固定：
+
+- old cache 中的 K 视为已经处在正确位置编码空间，不能重复旋转。
+- current chunk 的 Q 和 `k_new` 使用绝对位置旋转。
+- append 到 cache 的 `k_new` 应该是已经旋转后的 K。
+
+因此 fused RoPE 是 `position_mode="rope"` 的一种内部实现方式，不应该成为长期用户心智的主入口。当前代码里如果保留 `fuse_rope`，也更适合作为过渡期或显式性能开关；发布文档里建议把它解释为 `position_mode="rope"` 下的 fused implementation。
+
+#### 6. Score modifier 的决策：先做稳定语义，不做通用表达式系统
+
+从 PyTorch、FlashAttention、xFormers、cuDNN 的接口看，`scale`、`softcap`、bias/mask 都是主流 attention 接口的一等语义。
+
+TileOps 当前阶段建议：
+
+- `sm_scale` 保持基础参数。
+- `softcap` 作为明确的一等参数。
+- `temperature` 暂不单独暴露，除非后面明确它和 `sm_scale` 的组合语义。
+- 通用 `score_mod` callable / expression 不进入首发范围。
+- `attn_bias` / `custom_mask` 以后可以作为更一般 score path 扩展，但需要单独定义 shape、layout 和广播规则。
+
+这个决策让接口足够覆盖现阶段模型需求，同时避免一开始就引入过大的通用 score modifier 系统。
+
+#### 7. FP8 / 量化 KV 的决策：不要只加一堆零散参数
+
+调研里 TensorRT-LLM、SGLang、FlashInfer 都说明，FP8 KV cache 更像 cache policy，而不是普通 dtype 的一个小变体。
+
+同时也要区分两类 FP8：
+
+- **serving KV cache FP8**：K/V cache 用 FP8 存储，写 cache 时量化，读 cache 时按 scale 反量化或把 scale 融入 attention 计算。
+- **attention compute FP8**：Q/K/V 作为 Tensor Core / WGMMA 的 FP8 输入参与计算，类似 FlashAttention-3 的 FP8 forward 路线。
+
+这两类可以共用一部分 scale 概念，但不是同一个用户能力。GQA prefill 的首发重点应放在 serving KV cache FP8；FA3-style FP8 compute 可以作为后续 H200 / WS / TMA 优化路线的一部分。
+
+首发 FP8 KV cache 明确采用 **dequant path**：
+
+- old cache 以 FP8 存储，kernel 读取时按 `k_scale/v_scale` 转回 fp16/bf16 计算语义。
+- current chunk 的 `k_new/v_new` 仍按 fp16/bf16 参与本次 attention。
+- append 时才把 current `k_new/v_new` 量化写回 FP8 cache。
+- QK 和 PV/ScoreV 不承诺走 FP8 Tensor Core。
+
+直接用 FP8 Tensor Core 计算需要另一套 kernel 设计：Q/current K/current V 也要按 tile 量化，scale 要和 MMA 路径对齐，还要处理 FP8 operand layout / swizzle、RoPE 后量化顺序、以及 softmax 后 value path 的数值恢复。这不是简单把 cache dtype 改成 FP8，因此放到后续 H200 / WS / TMA 优化阶段。
+
+因此发布设计里建议把量化 KV cache 作为独立能力描述：
+
+- 首先支持 `fp8 kv cache`，而不是承诺完整 `fp8 attention compute`。
+- 明确 K/V cache 的 storage dtype、scale dtype、scale granularity。
+- 明确 dequant 在 kernel 内还是 kernel 外发生。
+- 首发明确走 kernel 内 dequant，不启用 FP8 Tensor Core attention compute。
+- contiguous 和 paged cache 路径都要能表达量化 cache，但可以分阶段落地。
+
+当前调研到的 scale 粒度支持情况如下：
+
+| scale 粒度 | 已看到的支持方 | 说明 |
+| --- | --- | --- |
+| `per_tensor` | SGLang、FlashInfer、vLLM、TensorRT-LLM FP8 KV cache | 最常见的 serving KV cache 语义。`k_scale` / `v_scale` 各一个 scalar，FlashInfer 和 SGLang 的基础 FP8 KV cache 路线都属于这一类。 |
+| `per_head` / `per_kv_head` | vLLM；FlashAttention-3 kernel 层有类似 descale 形态 | vLLM 文档描述 per-attention-head scale：`q_scale=[num_heads]`，`k/v_scale=[num_kv_heads]`。FA3 源码里的 `q_descale/k_descale/v_descale` shape 是 `(batch, num_heads_k)`，更像 FP8 attention input descale，不是完整 cache policy。 |
+| `per_token_head` | vLLM | vLLM 有 `fp8_per_token_head` / `int8_per_token_head` KV cache mode，scale 在 cache-write kernel 中按 `(token, head)` 动态计算，checkpoint scale 不参与。 |
+| `per_page` | 暂未看到普通 FP8 KV cache 的主流公开接口 | paged KV 的 page table 是主流，但普通 FP8 scale 通常不是“每页一个 scale”。如果未来 TileOps 需要，可以作为 paged KV 的折中方案单独设计。 |
+| `per_block` | FlashInfer NVFP4 KV cache；TensorRT-LLM / ModelOpt 的低比特 block scaling 路线 | 注意这里容易混淆：FlashInfer 普通 FP8 KV cache 不是 per-block；`kv_cache_sf` 是给 NVFP4 KV cache 的 block scale。FP8 权重/激活 block quant 也不等价于 FP8 KV cache scale 粒度。 |
+
+因此 TileOps 首发不应该把所有粒度一次性塞进一个 kernel。建议拆成下面几个 kernel / 能力阶段：
+
+1. **contiguous FP8 KV cache read path**
+   - `q` 仍为 `fp16/bf16`。
+   - `k_cache/v_cache` 为 `fp8_e4m3fn`，先支持 `per_tensor` scale。
+   - kernel 内读取 FP8 K/V，并把 `k_scale` 融入 score path，把 `v_scale` 融入 value path 或输出缩放。
+
+2. **contiguous FP8 KV append path**
+   - `k_new/v_new` 输入为 `fp16/bf16`。
+   - 如果启用 fused RoPE，`k_new` 先 RoPE，再 quantize，再 append。
+   - scale 首发采用外部传入的 scalar；动态 scale 另开后续阶段。
+
+3. **paged FP8 KV cache read path**
+   - 复用 paged KV 的 `block_table` / page-major 布局。
+   - `per_tensor` scale 下计算最简单；后续可扩到 `per_kv_head`。
+   - `per_page` 不作为首发目标，除非 runtime 明确需要。
+
+4. **paged FP8 KV append path**
+   - 在 paged cache 中按 `block_table` 找 physical page，把量化后的 `k_new/v_new` 写入目标 token 位置。
+   - 与 fused RoPE 的顺序保持一致：RoPE -> quantize -> append。
+
+5. **per-kv-head scale 增强**
+   - scale shape 采用 `[Hkv]` 或可广播到 `[B, Hkv]` 的形式。
+   - GQA 映射必须按 `kv_head = q_head // group_size` 取 scale，而不是按 Q head 取。
+
+6. **per-token-head / dynamic scale 后续增强**
+   - 更接近 vLLM 的高精度 KV cache quant 方案。
+   - 需要额外 scale metadata，且 append、paged layout、读 cache kernel 都要一起设计。
+   - 不进入首发闭环。
+
+7. **FA3-style FP8 attention compute**
+   - Q/K/V 作为 FP8 Tensor Core 输入，配合 descale。
+   - 属于高性能 compute kernel，不等价于 serving KV cache quant。
+   - 需要专门处理 FP8 operand layout / swizzle、tile 级量化和 scale pipeline。
+   - 放到 H200 / WS / TMA 优化路线里推进。
+
+长期看，量化相关参数可以收敛成轻量配置对象，例如：
+
+```python
+kv_cache_config = KVCacheConfig(
+    storage_dtype="fp8",
+    scale_granularity="per_tensor",
+    scale_location="external",
+)
+```
+
+首发实现也可以先用显式参数，但 issue 和文档里需要先把概念边界写清楚，避免后续把 `k_scale`、`v_scale`、`cache_dtype`、`dequant_mode` 零散堆进每个 OP。
+
+#### 8. `return_lse` 的决策：承认重要性，但放低优先级
+
+FlashInfer、xFormers、cuDNN 都说明 `lse` / stats 是真实存在的接口需求，尤其在 backward、debug、组合 attention、数值分析或部分高级 runtime 中有价值。
+
+但 TileOps 当前 OP 习惯是 kernel 可内部返回 `(output, lse)`，公开 OP 默认只给 `output`。因此发布计划里建议：
+
+- 默认保持 `output_only`，符合当前 TileOps 调用习惯。
+- 把 `return_lse=True` 作为低优先级 open question 或后续增强项。
+- 如果未来暴露，返回契约统一为 `(output, lse)`，不要为每个 prefill 变体设计不同返回对象。
+
+#### 9. Paged KV 的决策：block table 是首发主线
+
+paged KV cache 首发建议采用 FlashAttention-like `block_table`：
+
+- `block_table[b, logical_page] -> physical_page`
+- physical pages 使用 page-major 布局
+- page allocation / eviction / prefix sharing 不由 OP 管理
+- OP 只消费 runtime 已经准备好的 page table
+
+这个决策的好处是：
+
+- 和现有 decode paged 思路更接近。
+- shape 固定，适合 TileOps 当前 OP 风格。
+- 便于先做非 TMA gather path，再在 H200/WS anchor 版本里考虑 TMA。
+
+page size 和 kernel block 的关系建议先按下面原则推进：
+
+- fast path 支持 contiguous 或等价连续访问。
+- gather path 假设 `page_size` 能整除 kernel 的 `block_n`，kernel 内用 `pages_per_block = block_n // page_size` 表达一个 KV block 覆盖多少 page。
+- 边界 token 通过真实 `cache_seqlens` / `total_len` mask 掉，不依赖 page padding 值正确。
+- page table 越界、cache capacity 不足属于 OP/runtime 输入校验，不放给 kernel 靠未定义行为处理。
+
+#### 10. H200 / WS / TMA 的决策：在发布范围内，但不是公开接口维度
+
+H200 上针对 prefill 的 WS/TMA-friendly 优化应该在 release scope 里，因为这是发布性能的一部分。
+
+但它不改变用户 API：
+
+- 用户仍然调用同一个 prefill OP。
+- OP 或 kernel map 根据硬件、shape、dtype、page layout 选择实现。
+- benchmark 需要覆盖这些路径，帮助判断 dispatch 是否应该切到 H200-specialized kernel。
+
+因此 H200/WS/TMA 是 release plan 的性能目标，不是额外公开 OP。
 
 ## 六、压缩版结论
 
