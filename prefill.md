@@ -1133,6 +1133,29 @@ class GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp(Op):
 对于 cache-aware prefill，建议固定：
 - 新写入 KV 的位置通过 `cache_positions_new` 或同等语义字段给出
 - 不能依赖“默认从 0 开始”这种隐式规则
+- old cache 中的 K 被视为已经按对应 logical position 完成位置编码，不能在当前 prefill 调用中重复编码
+
+RoPE 不应只表达为 `rope=True/False`。现代模型至少需要区分：
+
+| 参数 | 含义 |
+| --- | --- |
+| `rope_style` | rotation layout，例如 `neox` / `non_neox`，首发 fused GQA prefill 以 `neox` 为主 |
+| `rotary_dim` | 参与 RoPE 的前缀维度，`None` 表示整个 head dim |
+| `rope_base` / `rope_theta` | 频率基底 |
+| `rope_scaling` | Llama scaling / YaRN / MRoPE 等频率或位置扩展策略，建议后续独立设计 |
+
+首发 release-facing 语义建议：
+
+- 外置 RoPE 路径允许调用方预先旋转 `q/k_new`，OP 只消费已经编码好的张量。
+- fused RoPE 路径只作为 cache-aware OP 内部实现路径。
+- fused RoPE 的实现不必等同于单个物理 kernel launch；OP 层可以先运行 append kernel，再运行 attention kernel。
+- 对 GQA 来说，append 的天然 dispatch 维度是 `Hkv`，attention 的天然 dispatch 维度是 `Hq`，不应为了“单 kernel”把 KV append 放进 query-head CTA 分支。
+- fused RoPE 首发支持 Neox-style full RoPE 和 partial RoPE：
+  - `rotary_dim is None` 等价于 `rotary_dim = head_dim`
+  - `rotary_dim < head_dim` 时，仅前 `rotary_dim` 维旋转，尾部维度保持原样
+  - 这覆盖 Qwen3.5 full-attention layer 这类 partial RoPE 场景
+- GPT-J / non-Neox legacy RoPE 可继续由 standalone RoPE op 覆盖，不应成为 fused GQA prefill 的主 benchmark 路径。
+- Llama4 的 NoPE layer、local chunk mask、QK norm、attention temperature tuning 属于模型级 attention 语义，应拆成后续 issue。
 
 #### 4. score modifier 规则
 
@@ -1301,6 +1324,41 @@ RoPE 不应在用户心智里首先表现为“是否 fused”。更自然的用
 
 因此 fused RoPE 是 `position_mode="rope"` 的一种内部实现方式，不应该成为长期用户心智的主入口。当前代码里如果保留 `fuse_rope`，也更适合作为过渡期或显式性能开关；发布文档里建议把它解释为 `position_mode="rope"` 下的 fused implementation。
 
+对最新模型的支持边界需要更细：
+
+- **Llama 3.x style full RoPE**：`rotary_dim == head_dim`，是 full-dim Neox RoPE anchor。
+- **Qwen3.5 full-attention layer**：`head_dim=256`、`rotary_dim=64` 这类 partial RoPE 应进入当前 GQA prefill 支持范围。
+- **Llama4 style**：RoPE layer 可复用 full/partial RoPE 能力；NoPE layer、local chunk mask、QK norm、attention temperature tuning 不应混入本轮 fused RoPE PR。
+- **Gemma2 style softcap**：softcap 是 score modifier，不是 RoPE 语义；benchmark 只保留少量 sentinel。
+- **GPT-J / non-Neox**：保留 compatibility，不作为现代 serving benchmark 主路径。
+
+因此更稳妥的长期接口心智是：
+
+```python
+position_mode="rope"
+rope_style="neox"
+rotary_dim=None        # None means full head_dim
+rope_base=10000.0
+```
+
+当前代码如果先暴露 `fuse_rope=True`，也应把 `rotary_dim` 纳入同一语义：`fuse_rope` 只是把 `position_mode="rope"` 的 current chunk rotation 放进 TileLang cache-aware path，而不是退回外部 torch RoPE。
+
+对 cache-aware fused RoPE，更准确的实现契约是：
+
+```text
+OP forward:
+    cos, sin = get_rope_tables(...)
+    append_kernel(k_new, v_new, cache/pages, positions, cos, sin)
+    output = attention_kernel(q, k_new, v_new, cache/pages, positions, cos, sin)
+```
+
+其中：
+
+- append kernel 负责把 current KV materialize 到 cache/page，写入的是 rotated K。
+- attention kernel 负责本次 attention 计算，读取 old cache 和 current `k_new/v_new`，不依赖刚写入 cache 的 current chunk。
+- attention kernel 不 mutation cache/page tensor。
+- 这种拆分仍然属于 fused RoPE OP，因为 RoPE 没有退回外部 torch 预处理。
+
 #### 6. Score modifier 的决策：先做稳定语义，不做通用表达式系统
 
 从 PyTorch、FlashAttention、xFormers、cuDNN 的接口看，`scale`、`softcap`、bias/mask 都是主流 attention 接口的一等语义。
@@ -1314,6 +1372,8 @@ TileOps 当前阶段建议：
 - `attn_bias` / `custom_mask` 以后可以作为更一般 score path 扩展，但需要单独定义 shape、layout 和广播规则。
 
 这个决策让接口足够覆盖现阶段模型需求，同时避免一开始就引入过大的通用 score modifier 系统。
+
+benchmark 层面不应把 softcap 展开成完整矩阵。softcap 更适合作为少量 sentinel case；主 benchmark 应围绕现代 serving 场景，例如 Qwen3.5 full-attention layer 的 paged KV + partial RoPE。
 
 #### 7. FP8 / 量化 KV 的决策：不要只加一堆零散参数
 

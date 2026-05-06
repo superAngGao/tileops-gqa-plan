@@ -2,6 +2,8 @@
 
 日期：2026-04-27
 
+更新：2026-05-06，补充 #1100 / #1101 的 RoPE 位置语义、partial RoPE、benchmark 收敛决策，以及 PR #1234 后 fused RoPE append 的 op 层编排方式。
+
 目标：把 GQA prefill 从当前已经完成的 dense / varlen / contiguous-cache / paged-cache 功能面，收敛到 `prefill.md` 中定义的 release-facing operator family，并明确剩余的 FP8 KV cache、benchmark、H200/Hopper dispatch 和 manifest 工作。
 
 本文只讨论 GQA prefill operator family，不讨论完整 serving runtime、调度器、prefix cache 命中策略或 page manager 生命周期。
@@ -28,25 +30,32 @@
    - dense BSHD current chunk
    - contiguous KV cache：`[B, Skv_cap, Hkv, D]`
    - `cache_seqlens` 表示 append 前已有 KV 长度
-   - fused kernel 同时完成：
+   - non-RoPE cache kernel 同时完成：
      - old KV 从 cache 读取
      - current chunk KV 从 `k_new/v_new` 读取
      - append `k_new/v_new` 到 `k_cache/v_cache`
+   - fused RoPE 路径由 OP 层顺序编排两个 TileLang kernel：
+     - append kernel 按 `heads_kv` dispatch，把 rotated `k_new` 和 `v_new` 写入 cache
+     - attention kernel 按 `heads` dispatch，只计算 attention，不 mutation cache
    - `cache_seqlens` 不要求 block 对齐
-   - current fused kernel 使用 `T.Pipelined`，但禁用 TMA lowering 和 warp-specialized lowering，以避开动态 cache/new 分流 load 的 mbarrier lowering 问题
+   - attention 不依赖本次调用刚 append 到 cache 的 current chunk，因此 fused RoPE split 不需要 kernel 内全局同步
 
 4. `GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp`
    - packed THD current chunk
    - flattened physical page storage：`[P_tokens, Hkv, D]`
    - `block_table[b, logical_page] -> physical_page`
    - `cache_seqlens` 表示 append 前已有 KV 长度
-   - kernel 同时完成 old paged KV gather、current chunk attention、current KV append
+   - non-RoPE cache kernel 同时完成 old paged KV gather、current chunk attention、current KV append
+   - fused RoPE 路径同样由 OP 层先 append、后 attention：
+     - append kernel 按 `heads_kv` 和 logical page position 写入 physical pages
+     - attention kernel 只根据 `block_table` gather old pages，并从 `k_new/v_new` 读取 current chunk
    - 已覆盖 page size `16 / 32 / 64 / 128`
 
 5. RoPE / score modifier
    - 外置 RoPE regression 覆盖 contiguous cache 和 paged cache
    - contiguous fused RoPE 已支持
    - paged fused RoPE 已支持
+   - 当前 fused RoPE 首版是 Neox-style RoPE；本轮应扩展到 `rotary_dim`，覆盖 Qwen3.5 full-attention layer 的 partial RoPE
    - `sm_scale` 已支持
    - `softcap` 已支持，`None` / `0` 表示 disabled，`>0` 表示启用
    - 公开 OP 默认保持 output-only；`return_lse` 仍是低优先级 open question
@@ -78,6 +87,7 @@
 - paged KV cache prefill 路径
 - 混合 batch 下稳定支持 `q_len != kv_len`
 - 清楚的位置接口，包括 RoPE offset / cache position
+- 支持 modern serving 常见的 Neox-style partial RoPE：`rotary_dim < head_dim`
 - 明确的 `output` 返回契约，`lse` 暴露作为低优先级 open question
 - 明确的 `sm_scale` / softcap 等 score modifier 契约
 - fp16 / bf16 稳定覆盖
@@ -90,6 +100,8 @@
 - page allocation / eviction / reuse 策略
 - prefill/decode scheduler
 - 任意通用 mask / block mask
+- Llama4 local chunk mask、NoPE layer dispatch、QK norm、attention temperature tuning 的完整模型路径
+- YaRN / MRoPE / Llama3.1 scaling 在 fused GQA prefill 内的一次性全覆盖
 - FP8 Tensor Core attention compute
 - 完整多模态 prefix 区域语义
 
@@ -120,6 +132,8 @@
   - serving runtime 主力接口
 
 OP 层负责 dispatch，kernel 层负责固定契约的实现。
+
+OP 层也可以组合多个 kernel 完成一个 release-facing 语义。例如 fused RoPE cache-aware prefill 中，append 是单独的 KV-head kernel，attention 是单独的 query-head kernel；这仍属于同一个 OP 的实现细节。这里的 `fuse_rope` 含义是 RoPE 在 TileLang 路径内完成，不要求 append 和 attention 必须 fuse 成一个物理 kernel launch。
 
 不要按实现细节暴露 OP。例如不暴露：
 
@@ -183,6 +197,22 @@ else:
 ```
 
 注意：attention 不依赖本 kernel 内刚写入 cache 的 current chunk，因此不需要 kernel 内全局同步。
+
+在 fused RoPE 路径中，append 和 attention 进一步解耦：
+
+```text
+append_kernel:
+    rotate k_new with absolute positions
+    write rotated k_new and v_new to cache
+
+attention_kernel:
+    rotate q and current k_new for this call
+    read old rotated K from cache
+    read current K/V from k_new/v_new
+    do not mutate cache
+```
+
+这样 append 的 dispatch 维度保持为 `Hkv`，attention 的 dispatch 维度保持为 `Hq`，避免在 GQA 下把 KV append 绑到 query-head CTA 分支里。
 
 ### 4.3 Packed / Varlen THD
 
@@ -430,13 +460,14 @@ forward(
 - 复用 varlen 的 `cu_seqlens_q` 组织 batch 内 current chunk
 - 使用 flat page-major physical cache：`k_pages/v_pages [P * page_size, Hkv, D]`
 - `block_table[b, logical_page]` 映射到 physical page id
-- kernel 同时完成 old paged KV 读取、current chunk attention、current KV in-place append
+- non-RoPE kernel 同时完成 old paged KV 读取、current chunk attention、current KV in-place append
 - 首版约束 `page_size` 为 2 的幂，当前测试覆盖 `16 / 32 / 64 / 128`
 - 已新增非 TMA old-cache load fast path：
   - `page_size % block_n == 0`：一个 KV tile 是 page 内子块，整块规则 copy
   - `block_n % page_size == 0`：一个 KV tile 覆盖多个完整 page，按 page segment copy
 - append 写回已有单页整块 fast path；跨页 append 暂时走 generic path
 - 当前未做 split-k / page manager / TMA / benchmark
+- fused RoPE append 已从 paged attention kernel 中拆出，交由 OP 层先运行独立 append kernel，再运行只读 page cache 的 attention kernel
 
 ### 阶段 5：位置语义
 
@@ -460,6 +491,7 @@ RoPE 首版支持两条路径：
 
 - 外置 RoPE：GQA prefill family 消费已经旋转好的 `q` / `k`
 - contiguous fused RoPE：contiguous cache prefill OP 内部旋转 current chunk 的 `q/k_new`
+- paged fused RoPE：paged cache prefill OP 内部旋转 current packed chunk 的 `q/k_new`
 
 cache 中保存的 K 统一按已旋转后的 K 处理。
 
@@ -494,12 +526,39 @@ cache 中保存的 K 统一按已旋转后的 K 处理。
   - `GroupedQueryAttentionPrefillWithKVCacheFwdOp(..., fuse_rope=True, max_position=...)`
   - old cache K 视为已经 rotated，kernel 不重复旋转
   - current chunk 的 `q/k_new` 使用 `old_len_b + local_i` 在 kernel 内旋转
-  - append 写入 cache 的是 rotated `k_new`
+  - OP 层先运行独立 append kernel，写入 cache 的是 rotated `k_new`
+  - attention kernel 本身不 mutation `k_cache/v_cache`
 - 已新增 paged fused RoPE 路径：
   - `GroupedQueryAttentionPrefillPagedWithKVCacheFwdOp(..., fuse_rope=True, max_position=...)`
   - old page cache K 视为已经 rotated，kernel 只 gather 读取
   - current packed chunk 的 `q/k_new` 使用 `cache_seqlens[b] + local_i` 在 kernel 内旋转
-  - append 写入 physical page 的是 rotated `k_new`
+  - OP 层先运行独立 append kernel，写入 physical page 的是 rotated `k_new`
+  - attention kernel 本身不 mutation `k_pages/v_pages`
+
+#### 5.1 RoPE 支持矩阵与本轮边界
+
+当前不应把“支持 RoPE”理解成支持所有模型的位置编码细节。更准确的支持矩阵如下：
+
+| 模型 / 场景 | RoPE 形态 | 本轮处理 |
+| --- | --- | --- |
+| Llama 3.x style | full-dim Neox RoPE | 继续支持；`rotary_dim=None` 或 `rotary_dim=head_dim` |
+| Qwen3.5 full-attention layer | partial Neox RoPE，典型 `head_dim=256`、`rotary_dim=64` | 本轮应支持，是 benchmark 主场景 |
+| Llama4 RoPE layer | RoPE / NoPE interleaved，local chunk attention，另有 QK norm | 只复用 full/partial RoPE 能力；chunk mask、NoPE dispatch、QK norm 另开后续 issue |
+| Gemma2 style | attention softcap + RoPE | softcap 保留 correctness 和少量 sentinel benchmark，不作为主 benchmark 模型 |
+| GPT-J / non-Neox legacy | adjacent-pair RoPE | 保留 standalone RoPE op 覆盖；不进入 fused GQA prefill 主路径 |
+| YaRN / MRoPE / Llama scaling | 频率计算或多轴位置编码不同 | 不放进 #1100/#1101；后续单独设计 |
+
+本轮 fused RoPE 接口建议：
+
+- 新增 `rotary_dim: Optional[int] = None`
+- `rotary_dim is None` 时等价于 `rotary_dim = head_dim`
+- `rotary_dim` 必须为正偶数，且 `rotary_dim <= head_dim`
+- 仅前 `rotary_dim` 维参与 Neox-style rotation
+- `d >= rotary_dim` 的尾部维度保持原样
+- cos/sin table shape 使用 `[max_position, rotary_dim // 2]`
+- old cache K 仍视为已经按相同 `rotary_dim` 规则完成 rotation
+
+这个边界可以覆盖 Qwen3.5 full-attention layer 的主要 partial RoPE 需求，同时避免把 Llama4 chunk mask、QK norm、YaRN/MRoPE 等模型级差异塞进同一个 PR。
 
 ### 阶段 6：Score Modifiers 与 Stats
 
@@ -536,6 +595,8 @@ cache 中保存的 K 统一按已旋转后的 K 处理。
   - 覆盖 contiguous fused RoPE / paged fused RoPE 组合路径
 - 尚未支持 `temperature` / bias / mask extension
 - `return_lse` 仍保持低优先级 open question
+
+benchmark 中 softcap 不应按完整矩阵展开。当前主流 serving benchmark 应以 no-softcap 的 Qwen / Llama 类路径为主；softcap 只保留少量 sentinel，用来确认路径可编译、可统计、性能趋势可观察。
 
 ### 阶段 7：Numeric Format
 
@@ -580,15 +641,46 @@ cache 中保存的 K 统一按已旋转后的 K 处理。
 - per-page scale 暂不作为首发目标；per-block 更接近 NVFP4 / 低比特 block scaling，不应混进普通 FP8 KV cache 首发。
 - 后续如果做 FA3-style FP8 attention compute，应放到 H200 / WS / TMA 优化路线中单独设计。
 
+### 阶段 8：Benchmark / Manifest 收敛
+
+目标：benchmark 反映实际推理场景，而不是只按 feature flag 做笛卡尔积。
+
+当前决策：
+
+- benchmark 主轴采用 serving 场景命名，而不是 kernel 名称。
+- paged KV cache 是主要 serving 路径；contiguous cache 作为单请求 / 本地推理 / 对照路径。
+- fused RoPE benchmark 需要能代表真实链路，优先覆盖 partial RoPE。
+- softcap benchmark 比例保持低，只做 sentinel。
+- 每个新增 benchmark 必须有稳定、可统计的名字。
+
+建议新增 benchmark：
+
+| 目的 | benchmark 名称 | 说明 |
+| --- | --- | --- |
+| Qwen3.5 paged full-attention serving 主路径 | `qwen35-9b-prefill-paged-fullattn-b8-prefix32k-chunk1k-p64-partial-rope64-fp16` | packed current chunk + paged KV + partial RoPE |
+| Qwen3.5 paged mixed serving | `qwen35-9b-prefill-paged-fullattn-mixed-b8-p64-partial-rope64-fp16` | batch 内 prefix/chunk 长度不同 |
+| Qwen3.5 contiguous 对照路径 | `qwen35-9b-prefill-contig-fullattn-prefix32k-chunk1k-partial-rope64-fp16` | 单请求 / contiguous cache 对照 |
+| Llama-style full RoPE anchor | `llama31-8b-prefill-paged-b8-prefix4k-chunk512-p64-full-rope-fp16` | 确认 full-dim RoPE 仍稳定 |
+| softcap sentinel | `gqa-prefill-paged-softcap50-b4-prefix4k-chunk512-p64-fp16` | 不绑定老模型名，只验证 softcap path |
+
+暂不建议新增大量 bf16 benchmark；bf16 correctness 在 tests 覆盖，benchmark 先用 fp16 控制 nightly 编译矩阵。
+
+manifest / benchmark 更新原则：
+
+- 新增或改变 release-facing OP 参数时，同 PR 更新 manifest。
+- benchmark workload 必须携带可读 label / id，便于 nightly 统计。
+- 新增 `rotary_dim`、`fuse_rope`、`softcap` 等参数时，manifest 中要表达默认值和 shape rule。
+- paged benchmark 的 `page_size`、`max_pages_per_req`、`cache_seqlens` / prefix 语义必须能从 workload 名称或参数中看出。
+
 ## 六、优先级建议
 
 从当前状态继续推进的推荐顺序：
 
-1. FP8 KV cache dequant path 设计和 manifest issue 收敛
-2. contiguous FP8 KV cache read + append
-3. paged FP8 KV cache read + append
-4. manifest/workload/roofline/source metadata 与 #1097-#1103 对齐
-5. benchmark matrix 和 nightly 形状覆盖
+1. 收尾 #1100 / #1101 / #1234 review：确认 PR CI、benchmark manifest 和 reviewer 反馈全部闭环
+2. FP8 KV cache dequant path 设计和 manifest issue 收敛
+3. contiguous FP8 KV cache read + append
+4. paged FP8 KV cache read + append
+5. manifest-backed nightly benchmark 趋势收集与回归阈值整理
 6. H200/Hopper dispatch 与 WS/TMA-friendly 优化
 7. 低优先级 `return_lse` / stats 暴露决策
 
@@ -640,14 +732,17 @@ cache 中保存的 K 统一按已旋转后的 K 处理。
 
 - 外置 RoPE 是稳定语义路径，调用方可传入已经旋转好的 `q/k_new`。
 - fused RoPE 是 cache-aware prefill 的内部实现路径，不单独成为公开 OP。
+- fused RoPE 不要求 append 和 attention 位于同一个物理 kernel；OP 层可以先 append 再 attention。
 - old cache K 视为已经 rotated，不能重复旋转。
 - current chunk 的 `q/k_new` 使用 absolute cache position 旋转。
 - append 写入 cache/page 的是 rotated `k_new`。
+- 本轮 fused RoPE 需要支持 `rotary_dim`，以覆盖 Qwen3.5 full-attention layer 的 partial RoPE。
 
 待决策：
 
 - 长期公开接口是否从 `fuse_rope` 过渡到更语义化的 `position_mode="rope"`。
 - 是否在 FP8 KV cache 首发中同时支持 fused RoPE，还是先要求外置 RoPE。
+- YaRN / MRoPE / Llama4 chunk mask / QK norm 是否分别拆成独立 position 或 mask issue。
 
 ### 4. TMA / Pipeline 优化
 
@@ -710,6 +805,8 @@ cache 中保存的 K 统一按已旋转后的 K 处理。
 - 公开 OP 默认 output-only，`return_lse` 保持低优先级 follow-up 或明确暴露契约
 - `sm_scale` 契约明确
 - `softcap=None` / `softcap=0` / `softcap>0` 语义明确
+- RoPE position semantics 明确，cache-aware 路径支持 absolute cache position
+- fused RoPE 支持 full-dim 和 partial `rotary_dim`
 - cache append 协议明确
 - paged KV metadata 协议明确
 - FP8 KV cache 首发 dequant path 契约明确
