@@ -4,7 +4,7 @@
 
 本文面向参与 TileOPs attention / serving kernel 工作的同事，解释 GQA prefill 这组接口为什么这样拆、各自负责什么，以及当前实现如何落到 OP / kernel / manifest / benchmark 上。
 
-更完整的能力调研见 `prefill.md`，发布收敛路线见 `prefill-plan.md`。本文偏工程讲解，不展开所有长期可能性。
+更完整的能力调研见 `gqa-prefill-presentation-script.md`，发布收敛路线见 `prefill-plan.md`。本文偏工程讲解，不展开所有长期可能性。
 
 ## 1. 我们对 prefill operator family 的期待
 

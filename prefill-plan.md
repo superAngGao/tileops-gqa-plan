@@ -4,7 +4,7 @@
 
 更新：2026-05-06，补充 #1100 / #1101 的 RoPE 位置语义、partial RoPE、benchmark 收敛决策，以及 PR #1234 后 fused RoPE append 的 op 层编排方式。
 
-目标：把 GQA prefill 从当前已经完成的 dense / varlen / contiguous-cache / paged-cache 功能面，收敛到 `prefill.md` 中定义的 release-facing operator family，并明确剩余的 FP8 KV cache、benchmark、H200/Hopper dispatch 和 manifest 工作。
+目标：把 GQA prefill 从当前已经完成的 dense / varlen / contiguous-cache / paged-cache 功能面，收敛到 `gqa-prefill-presentation-script.md` 中定义的 release-facing operator family，并明确剩余的 FP8 KV cache、benchmark、H200/Hopper dispatch 和 manifest 工作。
 
 本文只讨论 GQA prefill operator family，不讨论完整 serving runtime、调度器、prefix cache 命中策略或 page manager 生命周期。
 
